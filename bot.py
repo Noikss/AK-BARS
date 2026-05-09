@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 # ── Настройки ──────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8593827143:AAFgSm-Y5cKU1LYbQv6Bc9WeA2EauVbPsZM")
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "120"))   # секунды
 TICKETS_URL        = "https://www.ak-bars.ru/tickets"
 
