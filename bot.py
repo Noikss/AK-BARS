@@ -19,10 +19,10 @@ from telegram.ext import (
 )
 
 # ── Настройки ─────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8593827143:AAFgSm-Y5cKU1LYbQv6Bc9WeA2EauVbPsZM")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "120"))
 TICKETS_URL        = "https://www.ak-bars.ru/tickets"
-IRBIS_API          = "https://irbis.ak-bars.ru/api"   # рабочий по логам!
+IRBIS_API          = "https://irbis.ak-bars.ru/api"
 # ──────────────────────────────────────────────
 
 DATA_DIR = Path("/app/data")
@@ -81,9 +81,7 @@ HEADERS = {
 
 
 def find_token(obj, depth=0):
-    """Рекурсивно ищет токен в JSON любой вложенности."""
-    if depth > 5:
-        return None
+    if depth > 5: return None
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k.lower() in {"token","access_token","accesstoken","jwt","bearer","auth_token"} \
@@ -98,55 +96,77 @@ def find_token(obj, depth=0):
     return None
 
 
+async def check_connectivity(chat_id: int, app: Application) -> bool:
+    """Проверяем доступность сайта с серверов Bothost и сообщаем результат."""
+    test_urls = [
+        "https://irbis.ak-bars.ru/api/matches",
+        "https://www.ak-bars.ru",
+    ]
+    log.info(f"[{chat_id}] Проверяю доступность сайта...")
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        for url in test_urls:
+            try:
+                r = await client.get(url, timeout=8)
+                log.info(f"[{chat_id}] Connectivity OK: {url} → {r.status_code}")
+                return True
+            except httpx.ConnectTimeout:
+                log.error(f"[{chat_id}] ТАЙМАУТ подключения к {url} — сайт недоступен с серверов Bothost!")
+            except httpx.ConnectError as e:
+                log.error(f"[{chat_id}] ОШИБКА подключения к {url}: {e}")
+            except Exception as e:
+                log.error(f"[{chat_id}] Неизвестная ошибка {url}: {type(e).__name__}: {e}")
+    return False
+
+
 async def do_login(client: httpx.AsyncClient, phone: str, password: str) -> str | None:
     endpoints = [
-        f"{IRBIS_API}/auth/login",          # этот давал 200 по логам
+        f"{IRBIS_API}/auth/login",
         "https://www.ak-bars.ru/api/auth/login",
         "https://www.ak-bars.ru/api/v1/auth/login",
     ]
     payloads = [
         {"phone": phone, "password": password},
         {"login": phone, "password": password},
-        {"username": phone, "password": password},
     ]
     for url in endpoints:
         for payload in payloads:
             try:
-                r = await client.post(url, json=payload, timeout=15)
-                log.info(f"Login {url} payload_key={list(payload.keys())[0]} → {r.status_code}")
+                log.info(f"Пробую логин: {url} с полем '{list(payload.keys())[0]}'")
+                r = await client.post(url, json=payload, timeout=8)
+                log.info(f"Login {url} → {r.status_code}")
                 if r.status_code == 200:
                     try:
                         data = r.json()
                     except Exception:
-                        log.warning(f"Не JSON: {r.text[:200]}")
+                        log.warning(f"Ответ не JSON: {r.text[:200]}")
                         continue
-                    # Показываем весь ответ — так поймём структуру
-                    log.info(f"LOGIN RESPONSE: {str(data)[:800]}")
+                    log.info(f"LOGIN RESPONSE: {str(data)[:600]}")
                     token = find_token(data)
                     if token:
-                        log.info(f"Токен найден: {token[:20]}...")
                         return token
-                    # Если 200 но нет токена — сессия через cookie
                     if client.cookies:
-                        log.info(f"Cookie сессия: {dict(client.cookies)}")
+                        log.info(f"Cookie: {dict(client.cookies)}")
                         return "cookie"
-                    log.warning(f"200 OK но токен не найден, ключи: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                    log.warning(f"200 OK но токен не найден. Ключи: {list(data.keys()) if isinstance(data,dict) else type(data)}")
+            except httpx.ConnectTimeout:
+                log.error(f"ТАЙМАУТ логина: {url}")
+            except httpx.ConnectError as e:
+                log.error(f"ОШИБКА коннекта при логине {url}: {e}")
             except Exception as e:
-                log.debug(f"Login error {url}: {e}")
+                log.error(f"Login error {url}: {type(e).__name__}: {e}")
     return None
 
 
 async def get_matches(client: httpx.AsyncClient) -> list[dict]:
     endpoints = [
-        f"{IRBIS_API}/matches",             # давал 200 по логам!
+        f"{IRBIS_API}/matches",
         f"{IRBIS_API}/tickets",
-        f"{IRBIS_API}/schedule",
         "https://www.ak-bars.ru/api/matches",
         "https://www.ak-bars.ru/api/tickets",
     ]
     for url in endpoints:
         try:
-            r = await client.get(url, timeout=15)
+            r = await client.get(url, timeout=8)
             log.info(f"Fetch {url} → {r.status_code}")
             if r.status_code != 200:
                 continue
@@ -154,8 +174,7 @@ async def get_matches(client: httpx.AsyncClient) -> list[dict]:
                 data = r.json()
             except Exception:
                 continue
-            # Первый успешный ответ — логируем полностью для отладки
-            log.info(f"MATCHES RESPONSE: {str(data)[:1000]}")
+            log.info(f"MATCHES RESPONSE: {str(data)[:800]}")
             if isinstance(data, list) and data:
                 return data
             if isinstance(data, dict):
@@ -163,8 +182,12 @@ async def get_matches(client: httpx.AsyncClient) -> list[dict]:
                     val = data.get(key)
                     if isinstance(val, list) and val:
                         return val
+        except httpx.ConnectTimeout:
+            log.error(f"ТАЙМАУТ запроса матчей: {url}")
+        except httpx.ConnectError as e:
+            log.error(f"ОШИБКА коннекта при запросе матчей {url}: {e}")
         except Exception as e:
-            log.debug(f"Fetch error {url}: {e}")
+            log.error(f"Fetch error {url}: {type(e).__name__}: {e}")
     return []
 
 
@@ -172,17 +195,15 @@ def match_id(m):
     return str(m.get("id") or m.get("match_id") or m.get("uuid") or str(m)[:80])
 
 def match_label(m):
-    opp = m.get("opponent") or m.get("away_team") or m.get("title") or m.get("name") or "—"
+    opp  = m.get("opponent") or m.get("away_team") or m.get("title") or m.get("name") or "—"
     date = m.get("date") or m.get("match_date") or m.get("start_at") or ""
     price = m.get("price") or m.get("min_price") or m.get("minPrice") or ""
-    status = m.get("status") or m.get("ticketStatus") or ""
     parts = [f"🏒 {opp}"]
-    if date: parts.append(f"📅 {date}")
+    if date:  parts.append(f"📅 {date}")
     if price: parts.append(f"💰 от {price} ₽")
-    if status: parts.append(f"[{status}]")
     return " | ".join(parts)
 
-def match_available(m):
+def is_available(m):
     status = str(m.get("status") or m.get("ticketStatus") or "").lower()
     avail  = m.get("available") or m.get("ticketsAvailable")
     count  = m.get("tickets_count") or m.get("availableCount") or 0
@@ -192,27 +213,40 @@ def match_available(m):
     if status in {"available","open","on_sale","sale","active","доступно"}: return True
     if avail is True: return True
     if isinstance(count, int) and count > 0: return True
-    return True  # нет явного признака — считаем что есть
+    return True
 
 
 # ── Мониторинг ─────────────────────────────────
 
 async def monitor(chat_id: int, phone: str, password: str, app: Application):
     log.info(f"[{chat_id}] Мониторинг запущен")
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
 
+    # Сначала проверяем доступность
+    reachable = await check_connectivity(chat_id, app)
+    if not reachable:
+        await app.bot.send_message(
+            chat_id,
+            "❌ Сайт ak-bars.ru недоступен с серверов Bothost!\n\n"
+            "Это означает что Bothost блокирует запросы к сайту (или наоборот).\n\n"
+            "Смотри логи — там будет написано ТАЙМАУТ или ОШИБКА КОННЕКТА.\n"
+            "Напиши мне что написано в логах и я помогу решить."
+        )
+        # Продолжаем всё равно — вдруг временная проблема
+        log.warning(f"[{chat_id}] Сайт недоступен, продолжаю попытки...")
+
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
         await app.bot.send_message(chat_id, "🔐 Авторизуюсь на сайте...")
         token = await do_login(client, phone, password)
 
         if token and token != "cookie":
             client.headers.update({"Authorization": f"Bearer {token}"})
-            await app.bot.send_message(chat_id, "✅ Авторизация прошла! Мониторинг запущен — проверяю каждые 2 минуты.")
+            await app.bot.send_message(chat_id, "✅ Авторизация прошла! Мониторинг запущен.")
         elif token == "cookie":
             await app.bot.send_message(chat_id, "✅ Вошёл через сессию! Мониторинг запущен.")
         else:
             await app.bot.send_message(chat_id,
-                "⚠️ Не смог авторизоваться — смотрю матчи в открытом доступе.\n"
-                "Мониторинг продолжается. Посмотри логи на Bothost — там виден ответ API.")
+                "⚠️ Авторизация не удалась — продолжаю как гость.\n"
+                "Мониторинг работает. Смотри логи на Bothost.")
 
         check_count = 0
         while True:
@@ -221,7 +255,7 @@ async def monitor(chat_id: int, phone: str, password: str, app: Application):
                 check_count += 1
                 now = datetime.now().strftime("%H:%M")
 
-                available = [m for m in matches if match_available(m)]
+                available = [m for m in matches if is_available(m)]
                 new_ones  = [m for m in available if not db_seen(chat_id, match_id(m))]
 
                 if new_ones:
@@ -244,7 +278,7 @@ async def monitor(chat_id: int, phone: str, password: str, app: Application):
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                log.error(f"[{chat_id}] Ошибка: {e}")
+                log.error(f"[{chat_id}] Ошибка в цикле: {type(e).__name__}: {e}")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
@@ -265,7 +299,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("🔑 Теперь введи пароль _(удалится сразу)_", parse_mode="Markdown")
+    await update.message.reply_text("🔑 Введи пароль _(удалится сразу)_", parse_mode="Markdown")
     return PASSWORD
 
 async def got_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
