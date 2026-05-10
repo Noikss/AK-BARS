@@ -208,10 +208,10 @@ async def monitor(chat_id: int, phone: str, password: str, app: Application):
                 else:
                     log.info(f"[{chat_id}] #{check_count} {now} матчей={len(matches)} доступных={len(available)} новых=0")
 
-                if check_count % 20 == 0:
+                if check_count % 60 == 0:
                     await app.bot.send_message(chat_id,
                         f"🔄 Бот работает. Проверок: {check_count}\n"
-                        f"Матчей: {len(matches)}, с билетами: {len(available)}\n🕐 {now}")
+                        f"Матчей: {len(matches)}, с билетами: {len(available)}")
 
             except asyncio.CancelledError:
                 return
@@ -249,6 +249,20 @@ async def got_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=ReplyKeyboardMarkup([["/stop", "/status"]], resize_keyboard=True))
     tasks[chat_id] = asyncio.create_task(monitor(chat_id, phone, password, ctx.application))
     return ConversationHandler.END
+
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает как будет выглядеть уведомление о билетах."""
+    chat_id = update.effective_chat.id
+    fake = [
+        {"id": 1, "name": "Ак Барс — Металлург", "date": "2026-09-10 19:00", "min_price": 500, "available": True},
+        {"id": 2, "name": "Ак Барс — ЦСКА", "date": "2026-09-15 19:00", "min_price": 800, "available": True},
+    ]
+    lines = "\n".join(match_label(m) for m in fake)
+    await update.message.reply_text(
+        f"🚨 *БИЛЕТЫ ПОЯВИЛИСЬ!*\n\n{lines}\n\n"
+        f"👉 [Купить](https://www.ak-bars.ru/tickets)\n\n"
+        f"_(это тестовое сообщение)_",
+        parse_mode="Markdown", disable_web_page_preview=True)
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -292,6 +306,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     log.info("🤖 Бот запущен")
