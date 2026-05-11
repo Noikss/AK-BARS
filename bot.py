@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram-бот: мониторинг билетов ХК Ак Барс
-API: api.ak-bars.ru/portal/
-Авторизация: cookie-сессия после POST /portal/auth/login
+API билетов: api.tna-tickets.ru
+Авторизация: api.ak-bars.ru/portal/auth/login
 """
 
 import asyncio
@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 
 import httpx
-import httpx_socks  # pip install httpx-socks
+import httpx_socks
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -24,13 +24,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8593827143:AAFgSm-Y5cKU1LY
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "120"))
 TICKETS_URL        = "https://www.ak-bars.ru/tickets"
 
-API_BASE    = "https://api.ak-bars.ru/portal"
-API_LOGIN   = f"{API_BASE}/auth/login"
-API_USER    = f"{API_BASE}/auth/user"
-API_TICKETS = f"{API_BASE}/tickets"
-API_MATCHES = f"{API_BASE}/matches"
-API_EVENTS  = f"{API_BASE}/events"
-API_SCHEDULE= f"{API_BASE}/schedule"
+# Авторизация
+AK_LOGIN_URL = "https://api.ak-bars.ru/portal/auth/login"
+
+# TNA Tickets API — реальный источник билетов
+TNA_TOKEN    = "5f4dbf2e5629d8cc19e7d51874266678"
+TNA_GAMES    = f"https://api.tna-tickets.ru/api/v1/game?access-token={TNA_TOKEN}&sport=1"
+TNA_SECTORS  = "https://api.tna-tickets.ru/api/v1/booking/{id}/sectors?access-token=" + TNA_TOKEN
+
+# Прокси
+PROXY = "socks5://okurali02g:ZCUqsM7kgx@45.153.163.149:50101"
 
 DATA_DIR = Path("/app/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -79,7 +82,7 @@ PHONE, PASSWORD = range(2)
 tasks: dict[int, asyncio.Task] = {}
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
     "Origin": "https://www.ak-bars.ru",
@@ -88,105 +91,140 @@ HEADERS = {
 
 
 async def do_login(client: httpx.AsyncClient, phone: str, password: str) -> bool:
-    """
-    Авторизация. Сервер возвращает {dId, firstName, lastName} — токен в cookie.
-    После логина делаем GET /auth/user чтобы получить Bearer токен.
-    """
     try:
-        r = await client.post(API_LOGIN, json={"login": phone, "password": password}, timeout=15)
-        log.info(f"Login → {r.status_code} | body: {r.text[:200]}")
-        log.info(f"Login cookies: {dict(client.cookies)}")
-        log.info(f"Login response headers: {dict(r.headers)}")
-
+        r = await client.post(AK_LOGIN_URL, json={"login": phone, "password": password}, timeout=15)
+        log.info(f"Login → {r.status_code}")
         if r.status_code != 200:
+            log.error(f"Login failed: {r.text[:200]}")
             return False
-
-        # Токен приходит в заголовке ak-token
         ak_token = r.headers.get("ak-token") or r.headers.get("AK-Token")
         if ak_token:
             client.headers.update({"Authorization": f"Bearer {ak_token}"})
-            log.info(f"Токен получен из заголовка ak-token!")
+            log.info("Токен получен!")
             return True
-
+        log.warning("200 OK но токен не найден")
         return True
-
     except Exception as e:
-        log.error(f"Login exception: {type(e).__name__}: {e}")
+        log.error(f"Login error: {e}")
         return False
 
 
 async def get_tickets(client: httpx.AsyncClient) -> list[dict]:
-    endpoints = [
-        API_TICKETS, API_MATCHES, API_EVENTS, API_SCHEDULE,
-        "https://api.ak-bars.ru/portal/games",
-        "https://api.ak-bars.ru/portal/game",
-        "https://api.ak-bars.ru/portal/home-games",
-        "https://api.ak-bars.ru/portal/homeGames",
-        "https://api.ak-bars.ru/portal/sale",
-        "https://api.ak-bars.ru/portal/orders",
-        "https://irbis.ak-bars.ru/api/matches",
-    ]
-    for url in endpoints:
-        try:
-            r = await client.get(url, timeout=15)
-            log.info(f"Fetch {url} → {r.status_code}")
-            if r.status_code != 200:
+    """Получаем матчи и проверяем секторы через api.tna-tickets.ru"""
+    result = []
+    try:
+        # Шаг 1: список матчей
+        r = await client.get(TNA_GAMES, timeout=15)
+        log.info(f"TNA Games → {r.status_code}")
+        if r.status_code != 200:
+            log.error(f"TNA Games error: {r.text[:200]}")
+            return []
+
+        data = r.json()
+        log.info(f"TNA Games response: {str(data)[:600]}")
+
+        # Извлекаем список игр
+        games = []
+        if isinstance(data, list):
+            games = data
+        elif isinstance(data, dict):
+            for key in ("data", "items", "results", "games", "matches", "list"):
+                if isinstance(data.get(key), list):
+                    games = data[key]
+                    break
+
+        log.info(f"Матчей найдено: {len(games)}")
+
+        # Шаг 2: для каждого матча проверяем секторы
+        for game in games:
+            gid = (game.get("booking_id") or game.get("id") or
+                   game.get("game_id") or game.get("uuid"))
+            if not gid:
+                log.warning(f"Нет ID у матча: {game}")
                 continue
-            data = r.json()
-            log.info(f"Data from {url}: {str(data)[:400]}")
-            if isinstance(data, list) and data:
-                return data
-            if isinstance(data, dict):
-                for key in ("data","items","results","matches","tickets","events","schedule"):
-                    val = data.get(key)
-                    if isinstance(val, list) and val:
-                        return val
-        except Exception as e:
-            log.error(f"Fetch error {url}: {type(e).__name__}: {e}")
-    return []
+
+            sectors_url = TNA_SECTORS.format(id=gid)
+            try:
+                rs = await client.get(sectors_url, timeout=15)
+                log.info(f"Sectors [{gid}] → {rs.status_code}")
+                if rs.status_code != 200:
+                    continue
+
+                sd = rs.json()
+                log.info(f"Sectors [{gid}]: {str(sd)[:400]}")
+
+                sectors = []
+                if isinstance(sd, list):
+                    sectors = sd
+                elif isinstance(sd, dict):
+                    for key in ("data", "items", "sectors", "results"):
+                        if isinstance(sd.get(key), list):
+                            sectors = sd[key]
+                            break
+
+                # Считаем свободные места
+                free = []
+                for s in sectors:
+                    cnt = (s.get("available") or s.get("free") or
+                           s.get("count") or s.get("seats_available") or
+                           s.get("free_seats") or 0)
+                    if cnt and int(cnt) > 0:
+                        free.append(s)
+
+                log.info(f"Матч [{gid}]: секторов={len(sectors)}, свободных={len(free)}")
+
+                game["_id"] = str(gid)
+                game["_sectors_total"] = len(sectors)
+                game["_sectors_free"] = len(free)
+                game["_has_tickets"] = len(free) > 0
+                result.append(game)
+
+            except Exception as e:
+                log.error(f"Sectors [{gid}] error: {e}")
+
+    except Exception as e:
+        log.error(f"TNA Games exception: {e}")
+
+    return result
 
 
-def match_id(m):
-    return str(m.get("booking_id") or m.get("id") or m.get("uuid") or str(m)[:80])
+def game_id(m):
+    return str(m.get("_id") or m.get("booking_id") or m.get("id") or str(m)[:50])
 
-def match_label(m):
-    # tna-tickets.ru формат
+def game_label(m):
     home  = m.get("home_team") or m.get("home") or "Ак Барс"
-    away  = m.get("away_team") or m.get("away") or m.get("guest") or m.get("opponent") or m.get("title") or m.get("name") or "—"
-    date  = m.get("date") or m.get("match_date") or m.get("start_at") or m.get("startAt") or m.get("game_date") or ""
-    price = m.get("price") or m.get("min_price") or m.get("minPrice") or m.get("min_cost") or ""
-    booking_id = m.get("booking_id") or m.get("id") or ""
-
-    sectors = m.get("_sectors", [])
-    free_sectors = [s for s in sectors if (s.get("available", 0) or s.get("free", 0) or s.get("count", 0)) > 0]
+    away  = (m.get("away_team") or m.get("away") or m.get("guest") or
+             m.get("opponent") or m.get("title") or m.get("name") or "—")
+    date  = (m.get("date") or m.get("game_date") or m.get("match_date") or
+             m.get("start_at") or m.get("startAt") or "")
+    price = (m.get("price") or m.get("min_price") or m.get("minPrice") or
+             m.get("min_cost") or "")
+    free  = m.get("_sectors_free", 0)
+    total = m.get("_sectors_total", 0)
 
     parts = [f"🏒 {home} — {away}"]
     if date:  parts.append(f"📅 {date}")
     if price: parts.append(f"💰 от {price} ₽")
-    if free_sectors:
-        parts.append(f"✅ Свободных секторов: {len(free_sectors)}")
-    if booking_id:
-        parts.append(f"🔗 ak-bars.ru/tickets → матч {booking_id}")
+    parts.append(f"✅ Свободных секторов: {free} из {total}")
     return "\n".join(parts)
 
-def is_available(m):
-    # Матч считается доступным если есть хоть один свободный сектор
-    return m.get("_has_tickets", False) or bool(m.get("_sectors"))
+def has_tickets(m):
+    return m.get("_has_tickets", False)
 
 
 async def monitor(chat_id: int, phone: str, password: str, app: Application):
     log.info(f"[{chat_id}] Мониторинг запущен")
 
-    proxy = "socks5://okurali02g:ZCUqsM7kgx@45.153.163.149:50101"
-    transport = httpx_socks.AsyncProxyTransport.from_url(proxy)
+    transport = httpx_socks.AsyncProxyTransport.from_url(PROXY)
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, transport=transport) as client:
+
         await app.bot.send_message(chat_id, "🔐 Авторизуюсь на сайте...")
         ok = await do_login(client, phone, password)
 
         if ok:
             await app.bot.send_message(chat_id, "✅ Авторизация прошла! Мониторинг запущен — проверяю каждые 2 минуты.")
         else:
-            await app.bot.send_message(chat_id, "⚠️ Ошибка авторизации. Проверь логин/пароль и нажми /start.")
+            await app.bot.send_message(chat_id, "⚠️ Ошибка авторизации. Нажми /start и попробуй снова.")
             return
 
         check_count = 0
@@ -196,25 +234,27 @@ async def monitor(chat_id: int, phone: str, password: str, app: Application):
                 check_count += 1
                 now = datetime.now().strftime("%H:%M")
 
-                available = [m for m in matches if is_available(m)]
-                new_ones  = [m for m in available if not db_seen(chat_id, match_id(m))]
+                # Матчи с билетами
+                with_tickets = [m for m in matches if has_tickets(m)]
+                # Новые (ещё не уведомляли)
+                new_ones = [m for m in with_tickets if not db_seen(chat_id, game_id(m))]
 
                 if new_ones:
                     for m in new_ones:
-                        db_mark(chat_id, match_id(m))
-                    lines = "\n".join(match_label(m) for m in new_ones[:10])
+                        db_mark(chat_id, game_id(m))
+                    lines = "\n\n".join(game_label(m) for m in new_ones[:5])
                     await app.bot.send_message(
                         chat_id,
                         f"🚨 *БИЛЕТЫ ПОЯВИЛИСЬ!*\n\n{lines}\n\n"
-                        f"👉 [Купить]({TICKETS_URL})\n🕐 {now}",
+                        f"👉 [Купить на сайте]({TICKETS_URL})\n🕐 {now}",
                         parse_mode="Markdown", disable_web_page_preview=True)
                 else:
-                    log.info(f"[{chat_id}] #{check_count} {now} матчей={len(matches)} доступных={len(available)} новых=0")
+                    log.info(f"[{chat_id}] #{check_count} {now} матчей={len(matches)} с_билетами={len(with_tickets)} новых=0")
 
                 if check_count % 60 == 0:
                     await app.bot.send_message(chat_id,
                         f"🔄 Бот работает. Проверок: {check_count}\n"
-                        f"Матчей: {len(matches)}, с билетами: {len(available)}")
+                        f"Матчей: {len(matches)}, с билетами: {len(with_tickets)}")
 
             except asyncio.CancelledError:
                 return
@@ -249,23 +289,9 @@ async def got_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception: pass
     db_save(chat_id, phone, password)
     await update.message.reply_text("⏳ Запускаю...",
-        reply_markup=ReplyKeyboardMarkup([["/stop", "/status"]], resize_keyboard=True))
+        reply_markup=ReplyKeyboardMarkup([["/stop", "/status", "/test"]], resize_keyboard=True))
     tasks[chat_id] = asyncio.create_task(monitor(chat_id, phone, password, ctx.application))
     return ConversationHandler.END
-
-async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Показывает как будет выглядеть уведомление о билетах."""
-    chat_id = update.effective_chat.id
-    fake = [
-        {"id": 1, "name": "Ак Барс — Металлург", "date": "2026-09-10 19:00", "min_price": 500, "available": True},
-        {"id": 2, "name": "Ак Барс — ЦСКА", "date": "2026-09-15 19:00", "min_price": 800, "available": True},
-    ]
-    lines = "\n".join(match_label(m) for m in fake)
-    await update.message.reply_text(
-        f"🚨 *БИЛЕТЫ ПОЯВИЛИСЬ!*\n\n{lines}\n\n"
-        f"👉 [Купить](https://www.ak-bars.ru/tickets)\n\n"
-        f"_(это тестовое сообщение)_",
-        parse_mode="Markdown", disable_web_page_preview=True)
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -282,6 +308,17 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Мониторинг активен.")
     else:
         await update.message.reply_text("❌ Не запущен. /start")
+
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚨 *БИЛЕТЫ ПОЯВИЛИСЬ!*\n\n"
+        "🏒 Ак Барс — Локомотив\n"
+        "📅 15 мая 2026, 19:00\n"
+        "💰 от 3400 ₽\n"
+        "✅ Свободных секторов: 5 из 18\n\n"
+        "👉 [Купить на сайте](https://www.ak-bars.ru/tickets)\n\n"
+        "_(это тестовое сообщение)_",
+        parse_mode="Markdown", disable_web_page_preview=True)
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Отменено.")
@@ -309,9 +346,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
     app.add_handler(conv)
-    app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("test", cmd_test))
     log.info("🤖 Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
