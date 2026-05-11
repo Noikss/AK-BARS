@@ -147,28 +147,31 @@ async def get_tickets(client: httpx.AsyncClient) -> list[dict]:
 
 
 def match_id(m):
-    return str(m.get("id") or m.get("match_id") or m.get("uuid") or str(m)[:80])
+    return str(m.get("booking_id") or m.get("id") or m.get("uuid") or str(m)[:80])
 
 def match_label(m):
-    opp   = m.get("opponent") or m.get("away_team") or m.get("title") or m.get("name") or "—"
-    date  = m.get("date") or m.get("match_date") or m.get("start_at") or m.get("startAt") or ""
-    price = m.get("price") or m.get("min_price") or m.get("minPrice") or ""
-    parts = [f"🏒 {opp}"]
+    # tna-tickets.ru формат
+    home  = m.get("home_team") or m.get("home") or "Ак Барс"
+    away  = m.get("away_team") or m.get("away") or m.get("guest") or m.get("opponent") or m.get("title") or m.get("name") or "—"
+    date  = m.get("date") or m.get("match_date") or m.get("start_at") or m.get("startAt") or m.get("game_date") or ""
+    price = m.get("price") or m.get("min_price") or m.get("minPrice") or m.get("min_cost") or ""
+    booking_id = m.get("booking_id") or m.get("id") or ""
+
+    sectors = m.get("_sectors", [])
+    free_sectors = [s for s in sectors if (s.get("available", 0) or s.get("free", 0) or s.get("count", 0)) > 0]
+
+    parts = [f"🏒 {home} — {away}"]
     if date:  parts.append(f"📅 {date}")
     if price: parts.append(f"💰 от {price} ₽")
-    return " | ".join(parts)
+    if free_sectors:
+        parts.append(f"✅ Свободных секторов: {len(free_sectors)}")
+    if booking_id:
+        parts.append(f"🔗 ak-bars.ru/tickets → матч {booking_id}")
+    return "\n".join(parts)
 
 def is_available(m):
-    status = str(m.get("status") or m.get("ticketStatus") or m.get("ticket_status") or "").lower()
-    avail  = m.get("available") or m.get("ticketsAvailable") or m.get("tickets_available")
-    count  = m.get("tickets_count") or m.get("availableCount") or m.get("available_count") or 0
-    if status in {"sold_out","unavailable","closed","cancelled","распродано"}: return False
-    if avail is False: return False
-    if isinstance(count, int) and count == 0: return False
-    if status in {"available","open","on_sale","sale","active","доступно"}: return True
-    if avail is True: return True
-    if isinstance(count, int) and count > 0: return True
-    return True
+    # Матч считается доступным если есть хоть один свободный сектор
+    return m.get("_has_tickets", False) or bool(m.get("_sectors"))
 
 
 async def monitor(chat_id: int, phone: str, password: str, app: Application):
