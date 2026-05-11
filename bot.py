@@ -128,7 +128,7 @@ async def get_tickets(client: httpx.AsyncClient) -> list[dict]:
         if isinstance(data, list):
             games = data
         elif isinstance(data, dict):
-            for key in ("data", "items", "results", "games", "matches", "list"):
+            for key in ("result", "data", "items", "results", "games", "matches", "list"):
                 if isinstance(data.get(key), list):
                     games = data[key]
                     break
@@ -137,7 +137,7 @@ async def get_tickets(client: httpx.AsyncClient) -> list[dict]:
 
         # Шаг 2: для каждого матча проверяем секторы
         for game in games:
-            gid = (game.get("booking_id") or game.get("id") or
+            gid = (game.get("id") or game.get("booking_id") or
                    game.get("game_id") or game.get("uuid"))
             if not gid:
                 log.warning(f"Нет ID у матча: {game}")
@@ -189,7 +189,7 @@ async def get_tickets(client: httpx.AsyncClient) -> list[dict]:
 
 
 def game_id(m):
-    return str(m.get("_id") or m.get("booking_id") or m.get("id") or str(m)[:50])
+    return str(m.get("_id") or m.get("id") or m.get("booking_id") or str(m)[:50])
 
 def game_label(m):
     home  = m.get("home_team") or m.get("home") or "Ак Барс"
@@ -289,7 +289,7 @@ async def got_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception: pass
     db_save(chat_id, phone, password)
     await update.message.reply_text("⏳ Запускаю...",
-        reply_markup=ReplyKeyboardMarkup([["/stop", "/status", "/test"]], resize_keyboard=True))
+        reply_markup=ReplyKeyboardMarkup([["/stop", "/check"]], resize_keyboard=True))
     tasks[chat_id] = asyncio.create_task(monitor(chat_id, phone, password, ctx.application))
     return ConversationHandler.END
 
@@ -320,6 +320,43 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "_(это тестовое сообщение)_",
         parse_mode="Markdown", disable_web_page_preview=True)
 
+async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Мгновенная проверка билетов по запросу."""
+    chat_id = update.effective_chat.id
+    if chat_id not in tasks or tasks[chat_id].done():
+        await update.message.reply_text("❌ Мониторинг не запущен. Нажми /start")
+        return
+
+    await update.message.reply_text("🔍 Проверяю прямо сейчас...")
+
+    # Берём данные пользователя из БД
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute("SELECT phone, password FROM users WHERE chat_id=?", (chat_id,)).fetchone()
+    if not row:
+        await update.message.reply_text("❌ Не найден аккаунт. Нажми /start")
+        return
+
+    phone, password = row
+    transport = httpx_socks.AsyncProxyTransport.from_url(PROXY)
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, transport=transport) as client:
+        await do_login(client, phone, password)
+        matches = await get_tickets(client)
+
+    with_tickets = [m for m in matches if has_tickets(m)]
+    now = datetime.now().strftime("%H:%M")
+
+    if with_tickets:
+        lines = "\n\n".join(game_label(m) for m in with_tickets[:5])
+        await update.message.reply_text(
+            f"🚨 *БИЛЕТЫ ЕСТЬ!*\n\n{lines}\n\n"
+            f"👉 [Купить на сайте]({TICKETS_URL})\n🕐 {now}",
+            parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        await update.message.reply_text(
+            f"❌ Билетов пока нет\n"
+            f"Матчей на сайте: {len(matches)}\n"
+            f"🕐 Проверено в {now}")
+
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
@@ -349,6 +386,7 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("check", cmd_check))
     log.info("🤖 Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
